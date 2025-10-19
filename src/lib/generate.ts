@@ -26,7 +26,7 @@ export async function generateTwoLines(input: {
 }) {
   const sys = `You are a compassionate, succinct daily coach.
 Return JSON only with two short affirmations (<=18 words each), plus a category and visual_theme.
-No exclamation marks, no clichés, supportive, second-person. Allowed categories: focus, confidence, calm, gratitude, creativity.`;
+No exclamation marks, no clichés, supportive, second-person. Allowed categories: focus, confidence, calm, gratitude, creativity. Return strictly JSON, no markdown.`;
 
   const weatherPart =
     input.temperature != null && input.unit
@@ -43,13 +43,13 @@ Weather: ${weatherPart}
 Return JSON:
 {"lines":["...","..."],"category":"focus","visual_theme":"5–8 words"}`;
 
+  // Note: do NOT pass response_format; some OpenRouter models/types reject it.
   const res = await openai.chat.completions.create({
-    model: MODEL,
+    model: MODEL as string,
     messages: [
       { role: 'system', content: sys },
       { role: 'user', content: user },
     ],
-    response_format: { type: 'json_object' } as unknown, // some OR models accept this
     temperature: 0.7,
   });
 
