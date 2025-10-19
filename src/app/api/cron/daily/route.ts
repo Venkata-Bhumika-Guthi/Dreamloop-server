@@ -1,9 +1,8 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabaseAdmin';
 import { generateTwoLines } from '@/lib/generate';
-import { sendDailyCardPush } from '@/lib/pushExpo';
 import { fetchWeather } from '@/lib/weather';
-
+import { sendDailyCardPush } from '@/lib/pushExpo';
 
 export const runtime = 'nodejs';
 
@@ -13,9 +12,13 @@ function auth(req: Request) {
   return token && token === process.env.CRON_SECRET;
 }
 
-// naive window: treat users as due if local time >= daily_time_local and no row exists for today
+type CronResult =
+  | { user: string; status: 'ok'; sent: number }
+  | { user: string; status: 'not_due' }
+  | { user: string; status: 'error'; error: string };
+
 function isDue(nowLocal: Date, dailyHHMM: string): boolean {
-  const [hh, mm] = dailyHHMM.split(':').map(n => parseInt(n, 10));
+  const [hh, mm] = dailyHHMM.split(':').map((n) => parseInt(n, 10));
   const scheduled = new Date(nowLocal);
   scheduled.setHours(hh || 7, mm || 30, 0, 0);
   return nowLocal.getTime() >= scheduled.getTime();
@@ -23,9 +26,8 @@ function isDue(nowLocal: Date, dailyHHMM: string): boolean {
 
 export async function POST(req: Request) {
   try {
-    if (!auth(req)) return NextResponse.json({ ok:false, error:'unauthorized' }, { status:401 });
+    if (!auth(req)) return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
 
-    // Load active users
     const { data: profiles, error: pErr } = await supabaseAdmin
       .from('profiles')
       .select('user_id, goals, tone, language, timezone, lat, lon, daily_time_local, wants_push, is_paused')
@@ -33,17 +35,19 @@ export async function POST(req: Request) {
       .eq('is_paused', false);
     if (pErr) throw pErr;
 
-    const results: any[] = [];
+    const results: CronResult[] = [];
+
     for (const p of profiles ?? []) {
       try {
-        const tz = p.timezone || 'UTC';
+        const tz: string = p.timezone || 'UTC';
 
-        // Today in user's TZ
         const for_date = new Intl.DateTimeFormat('en-CA', {
-          timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit'
+          timeZone: tz,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
         }).format(new Date());
 
-        // if already generated for today, skip push/generation check (we’ll still push)
         const { data: existing } = await supabaseAdmin
           .from('affirmations')
           .select('id, lines')
@@ -51,26 +55,30 @@ export async function POST(req: Request) {
           .eq('for_date', for_date)
           .maybeSingle();
 
-        // local "now" for due check
-        const nowLocal = new Date(new Intl.DateTimeFormat('en-CA', {
-          timeZone: tz, hour12:false, hour:'2-digit', minute:'2-digit'
-        }).format(new Date()).replace(/-/g,'/')); // coarse
+        // Derive a "now" in tz for due check (coarse but fine)
+        const nowLocal = new Date(
+          new Intl.DateTimeFormat('en-CA', {
+            timeZone: tz,
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+          }).format(new Date()).replace(/-/g, '/')
+        );
 
         if (!existing && !isDue(nowLocal, p.daily_time_local)) {
           results.push({ user: p.user_id, status: 'not_due' });
           continue;
         }
 
-        // Ensure we have content
-        let lines = existing?.lines as string[] | undefined;
+        let lines: string[] | undefined = existing?.lines as string[] | undefined;
 
         if (!lines) {
-          const wx = await fetchWeather(p.lat, p.lon, tz);
+          const wx = await fetchWeather(p.lat as number | undefined, p.lon as number | undefined, tz);
           const weekday = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(new Date());
           const gen = await generateTwoLines({
-            goals: p.goals || [],
-            tone: p.tone || 'warm',
-            language: p.language || 'en',
+            goals: (p.goals as string[]) || [],
+            tone: (p.tone as string) || 'warm',
+            language: (p.language as string) || 'en',
             weekday,
             weatherSummary: wx?.summary,
             temperature: wx?.tempC,
@@ -79,34 +87,40 @@ export async function POST(req: Request) {
 
           const up = await supabaseAdmin
             .from('affirmations')
-            .upsert([{
-              user_id: p.user_id,
-              for_date,
-              lines: gen.lines,
-              category: gen.category,
-              visual_theme: gen.visual_theme,
-              weather: wx ?? null,
-              model: 'openrouter',
-              prompt_version: 1,
-            }], { onConflict: 'user_id,for_date' })
+            .upsert(
+              [
+                {
+                  user_id: p.user_id as string,
+                  for_date,
+                  lines: gen.lines,
+                  category: gen.category,
+                  visual_theme: gen.visual_theme,
+                  weather: (await fetchWeather(p.lat as number | undefined, p.lon as number | undefined, tz)) ?? null,
+                  model: 'openrouter',
+                  prompt_version: 1,
+                },
+              ],
+              { onConflict: 'user_id,for_date' }
+            )
             .select()
             .single();
           if (up.error) throw up.error;
           lines = up.data.lines as string[];
         }
 
-        // Push it
-        const sent = await sendDailyCardPush(p.user_id, lines);
-        results.push({ user: p.user_id, status: 'ok', sent: sent.sent });
-      } catch (inner: any) {
-        console.error('cron user error', p.user_id, inner);
-        results.push({ user: p.user_id, status: 'error', error: String(inner?.message || inner) });
+        const sentRes = await sendDailyCardPush(p.user_id as string, lines);
+        results.push({ user: p.user_id as string, status: 'ok', sent: sentRes.sent });
+      } catch (innerErr: unknown) {
+        const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+        console.error('cron user error', p.user_id, msg);
+        results.push({ user: String(p.user_id), status: 'error', error: msg });
       }
     }
 
-    return NextResponse.json({ ok:true, results });
-  } catch (e:any) {
-    console.error('cron/daily error:', e);
-    return NextResponse.json({ ok:false, error: String(e?.message || e) }, { status:500 });
+    return NextResponse.json({ ok: true, results });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('cron/daily error:', msg);
+    return NextResponse.json({ ok: false, error: msg }, { status: 500 });
   }
 }

@@ -2,6 +2,19 @@ import { openai } from './openai';
 
 const MODEL = process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini';
 
+const VALID_CATEGORIES = ['focus', 'confidence', 'calm', 'gratitude', 'creativity'] as const;
+type Cat = (typeof VALID_CATEGORIES)[number];
+
+function coerceCategory(raw: unknown): Cat {
+  const s = String(raw ?? '').toLowerCase();
+  for (const c of VALID_CATEGORIES) if (s.includes(c)) return c;
+  return 'focus';
+}
+
+function isStringArray(x: unknown): x is string[] {
+  return Array.isArray(x) && x.every((v) => typeof v === 'string');
+}
+
 export async function generateTwoLines(input: {
   goals: string[];
   tone: string;
@@ -9,21 +22,26 @@ export async function generateTwoLines(input: {
   weekday: string;
   weatherSummary?: string;
   temperature?: number;
-  unit?: 'C'|'F';
+  unit?: 'C' | 'F';
 }) {
   const sys = `You are a compassionate, succinct daily coach.
 Return JSON only with two short affirmations (<=18 words each), plus a category and visual_theme.
-No exclamation marks, no clichés, supportive, second-person.`;
+No exclamation marks, no clichés, supportive, second-person. Allowed categories: focus, confidence, calm, gratitude, creativity.`;
+
+  const weatherPart =
+    input.temperature != null && input.unit
+      ? `${input.weatherSummary ?? '—'}, ${input.temperature}°${input.unit}`
+      : `${input.weatherSummary ?? '—'}`;
 
   const user = `
 Goals: ${input.goals.join(', ') || 'general wellbeing'}
 Tone: ${input.tone}
 Language: ${input.language}
 Today: ${input.weekday}
-Weather: ${input.weatherSummary ?? '—'}, ${input.temperature ?? ''}${input.unit ?? ''}
+Weather: ${weatherPart}
 
 Return JSON:
-{"lines":["...","..."],"category":"focus|confidence|calm|gratitude|creativity","visual_theme":"5–8 words"}`;
+{"lines":["...","..."],"category":"focus","visual_theme":"5–8 words"}`;
 
   const res = await openai.chat.completions.create({
     model: MODEL,
@@ -31,26 +49,24 @@ Return JSON:
       { role: 'system', content: sys },
       { role: 'user', content: user },
     ],
-    // Many OpenRouter models support this; if not, we'll fall back below.
-    response_format: { type: 'json_object' } as any,
+    response_format: { type: 'json_object' } as unknown, // some OR models accept this
     temperature: 0.7,
   });
 
-  let txt = res.choices?.[0]?.message?.content ?? '{}';
+  const txt = res.choices?.[0]?.message?.content ?? '{}';
 
-  // Fallback: some models could wrap JSON in backticks or add prose.
-  // Try to extract the first JSON object if parsing fails.
-  let parsed: any;
+  // Robust JSON parse
+  let parsed: Record<string, unknown> = {};
   try {
-    parsed = JSON.parse(txt);
+    parsed = JSON.parse(txt) as Record<string, unknown>;
   } catch {
-    const match = txt.match(/\{[\s\S]*\}/);
-    parsed = match ? JSON.parse(match[0]) : {};
+    const m = txt.match(/\{[\s\S]*\}/);
+    if (m) parsed = JSON.parse(m[0]) as Record<string, unknown>;
   }
 
-  return {
-    lines: (parsed.lines as string[]) || [],
-    category: (parsed.category as string) || 'focus',
-    visual_theme: (parsed.visual_theme as string) || 'soft gradient waves',
-  };
+  const lines = isStringArray(parsed.lines) ? parsed.lines.slice(0, 2).map((s) => s.trim()) : [];
+  const category = coerceCategory(parsed.category);
+  const visual_theme = String(parsed.visual_theme ?? 'soft gradient waves');
+
+  return { lines, category, visual_theme };
 }
